@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>vMix-Player-Controller</AssemblyName>
+    <RootNamespace>VMixPlayerController</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Version>0.3.12</Version>
+    <Product>vMix Player Controller</Product>
+    <Title>vMix Player Controller</Title>
+    <Authors>vMix Player Controller</Authors>
+  </PropertyGroup>
+</Project>

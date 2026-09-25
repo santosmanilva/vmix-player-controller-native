@@ -1,0 +1,68 @@
+name: Build native Windows portable
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "native/**"
+      - ".github/workflows/build-native.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Publish native portable
+        run: >-
+          dotnet publish native/vMixPlayerController.csproj -c Release -r win-x64
+          --source https://api.nuget.org/v3/index.json
+          --self-contained true -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -o native/publish
+      - name: Publish lightweight portable
+        run: >-
+          dotnet publish native/vMixPlayerController.csproj -c Release -r win-x64
+          --source https://api.nuget.org/v3/index.json
+          --self-contained false -p:PublishSingleFile=true
+          -p:DebugType=None -p:DebugSymbols=false
+          -o native/publish-light
+      - name: Run native self-tests
+        shell: pwsh
+        run: |
+          $result = Join-Path $env:RUNNER_TEMP "vmix-player-self-test.txt"
+          $process = Start-Process native/publish/vMix-Player-Controller.exe -ArgumentList "--self-test=$result" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Self-test exit code $($process.ExitCode)" }
+          $text = Get-Content $result -Raw
+          if (-not $text.StartsWith("PASS")) { throw $text }
+          Write-Host $text
+          $lightResult = Join-Path $env:RUNNER_TEMP "vmix-player-light-self-test.txt"
+          $lightProcess = Start-Process native/publish-light/vMix-Player-Controller.exe -ArgumentList "--self-test=$lightResult" -Wait -PassThru
+          if ($lightProcess.ExitCode -ne 0) { throw "Light self-test exit code $($lightProcess.ExitCode)" }
+          $lightText = Get-Content $lightResult -Raw
+          if (-not $lightText.StartsWith("PASS")) { throw $lightText }
+          Write-Host $lightText
+          $toolsResult = Join-Path $env:RUNNER_TEMP "vmix-player-tools-smoke.txt"
+          $toolsProcess = Start-Process native/publish-light/vMix-Player-Controller.exe -ArgumentList "--demo", "--tools-smoke=$toolsResult" -Wait -PassThru
+          if ($toolsProcess.ExitCode -ne 0) { throw "Tools smoke-test exit code $($toolsProcess.ExitCode)" }
+          $toolsText = Get-Content $toolsResult -Raw
+          if (-not $toolsText.StartsWith("PASS")) { throw $toolsText }
+          Write-Host $toolsText
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vMix-Player-Controller-native
+          path: native/publish/vMix-Player-Controller.exe
+          if-no-files-found: error
+      - name: Upload lightweight artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vMix-Player-Controller-light
+          path: native/publish-light/vMix-Player-Controller.exe
+          if-no-files-found: error

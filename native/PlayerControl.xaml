@@ -1,0 +1,186 @@
+<UserControl x:Class="VMixPlayerController.PlayerControl"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             MinWidth="345" Focusable="True">
+    <UserControl.Resources>
+        <Style x:Key="PlayerCompactToggle" TargetType="ToggleButton" BasedOn="{StaticResource {x:Type ToggleButton}}">
+            <Setter Property="Padding" Value="7,4"/>
+            <Setter Property="Margin" Value="2"/>
+            <Setter Property="MinWidth" Value="30"/>
+            <Setter Property="FontSize" Value="10.5"/>
+        </Style>
+        <Style x:Key="AtemCompactCombo" TargetType="ComboBox" BasedOn="{StaticResource {x:Type ComboBox}}">
+            <Setter Property="Padding" Value="5,3"/>
+            <Setter Property="Margin" Value="2"/>
+            <Setter Property="MinHeight" Value="27"/>
+            <Setter Property="FontSize" Value="10.5"/>
+        </Style>
+    </UserControl.Resources>
+    <Border Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource StrokeBrush}"
+            BorderThickness="1" CornerRadius="12" Margin="5" Padding="12">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <Grid Grid.Row="0" Margin="2,0,2,8">
+                <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal">
+                    <Border Width="6" Height="25" CornerRadius="3" Background="{StaticResource AccentBrush}" Margin="0,0,9,0"/>
+                    <TextBlock x:Name="PlayerName" FontSize="18" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                </StackPanel>
+                <StackPanel Grid.Column="1" HorizontalAlignment="Right">
+                    <TextBlock x:Name="InputKind" Text="SIN ASIGNAR" Foreground="{StaticResource MutedBrush}" FontSize="10" FontWeight="Bold" HorizontalAlignment="Right"/>
+                    <TextBlock x:Name="InputState" Text="—" Foreground="{StaticResource MutedBrush}" FontSize="10" HorizontalAlignment="Right"/>
+                </StackPanel>
+            </Grid>
+
+            <ComboBox x:Name="InputSelector" Grid.Row="1" SelectionChanged="InputSelector_OnSelectionChanged"
+                      ToolTip="Selecciona un input de cualquiera de los dos vMix independientes"/>
+
+            <Grid x:Name="PlaybackSummaryPanel" Grid.Row="2" Margin="3,8,3,5">
+                <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <StackPanel>
+                    <TextBlock Text="AHORA" Foreground="{StaticResource MutedBrush}" FontSize="9" FontWeight="Bold"/>
+                    <TextBlock x:Name="NowText" Text="Sin contenido" FontSize="13" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                    <TextBlock x:Name="NextText" Text="SIGUIENTE  —" Foreground="{StaticResource MutedBrush}" FontSize="10" TextTrimming="CharacterEllipsis" Margin="0,3,0,0"/>
+                </StackPanel>
+                <Border Grid.Column="1" Background="#FF0C121A" BorderBrush="{StaticResource StrokeBrush}" BorderThickness="1" CornerRadius="7" Padding="8,5" VerticalAlignment="Center">
+                    <StackPanel>
+                        <TextBlock Text="RESTANTE" Foreground="{StaticResource MutedBrush}" FontSize="8" HorizontalAlignment="Center"/>
+                        <TextBlock x:Name="RemainingText" Text="00:00" FontSize="17" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <WrapPanel x:Name="TransportButtonsPanel" Grid.Row="3" HorizontalAlignment="Center" Margin="0,3">
+                <Button Content="|◀" ToolTip="Primer elemento" Click="First_OnClick"/>
+                <Button Content="◀" ToolTip="Anterior" Click="Previous_OnClick"/>
+                <ToggleButton x:Name="PlayPauseToggle" Content="▶" ToolTip="Reproducir" Click="PlayPause_OnClick" MinWidth="52"/>
+                <Button Content="↺" ToolTip="Reiniciar" Click="Restart_OnClick"/>
+                <Button Content="▶|" ToolTip="Siguiente" Click="Next_OnClick"/>
+                <Button Content="GO" ToolTip="Preparar Mix, reiniciar y reproducir" Click="Go_OnClick" Style="{StaticResource AccentButton}" MinWidth="48"/>
+            </WrapPanel>
+
+            <Grid x:Name="PositionPanel" Grid.Row="4" Margin="3,2,3,5">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <TextBlock x:Name="CurrentTimeText" Text="00:00" Foreground="{StaticResource MutedBrush}" FontSize="10" VerticalAlignment="Center" Margin="0,0,5,0"/>
+                <Slider x:Name="PositionSlider" Grid.Column="1" Minimum="0" Maximum="1" Value="0"
+                        PreviewMouseLeftButtonDown="PositionSlider_OnPreviewMouseLeftButtonDown"
+                        PreviewMouseLeftButtonUp="PositionSlider_OnPreviewMouseLeftButtonUp"
+                        ValueChanged="PositionSlider_OnValueChanged"/>
+                <TextBlock x:Name="DurationText" Grid.Column="2" Text="00:00" Foreground="{StaticResource MutedBrush}" FontSize="10" VerticalAlignment="Center" Margin="5,0,0,0"/>
+            </Grid>
+
+            <StackPanel x:Name="ListOptionsPanel" Grid.Row="5" Visibility="Collapsed">
+                <WrapPanel HorizontalAlignment="Center">
+                    <TextBlock Text="MIX" Foreground="{StaticResource MutedBrush}" FontWeight="Bold" FontSize="10" VerticalAlignment="Center" Margin="0,0,5,0"/>
+                    <ToggleButton Content="1" Tag="0" Click="Mix_OnClick" Style="{StaticResource PlayerCompactToggle}"/>
+                    <ToggleButton Content="2" Tag="1" Click="Mix_OnClick" Style="{StaticResource PlayerCompactToggle}"/>
+                    <ToggleButton Content="3" Tag="2" Click="Mix_OnClick" Style="{StaticResource PlayerCompactToggle}"/>
+                    <ToggleButton Content="4" Tag="3" Click="Mix_OnClick" Style="{StaticResource PlayerCompactToggle}"/>
+                    <ToggleButton x:Name="LoopToggle" Content="LOOP" Click="Loop_OnClick" Style="{StaticResource PlayerCompactToggle}"/>
+                    <ToggleButton x:Name="AutoNextToggle" Content="AUTO NEXT" Click="AutoNext_OnClick" Style="{StaticResource PlayerCompactToggle}"/>
+                </WrapPanel>
+            </StackPanel>
+
+            <WrapPanel x:Name="AudioBusPanel" Grid.Row="6" HorizontalAlignment="Center" Margin="0,0,0,2" Visibility="Collapsed">
+                <TextBlock Text="AUDIO" Foreground="{StaticResource MutedBrush}" FontWeight="Bold" FontSize="10"
+                           VerticalAlignment="Center" Margin="0,0,5,0"/>
+                <ToggleButton x:Name="AudioBusMToggle" Content="M" Tag="M" Click="AudioBusToggle_OnClick" Style="{StaticResource PlayerCompactToggle}"/>
+                <ToggleButton x:Name="AudioBusAToggle" Content="A" Tag="A" Click="AudioBusToggle_OnClick" Style="{StaticResource PlayerCompactToggle}"/>
+                <ToggleButton x:Name="AudioBusBToggle" Content="B" Tag="B" Click="AudioBusToggle_OnClick" Style="{StaticResource PlayerCompactToggle}"/>
+                <ToggleButton x:Name="AudioBusCToggle" Content="C" Tag="C" Click="AudioBusToggle_OnClick" Style="{StaticResource PlayerCompactToggle}"/>
+                <ToggleButton x:Name="AudioBusDToggle" Content="D" Tag="D" Click="AudioBusToggle_OnClick" Style="{StaticResource PlayerCompactToggle}"/>
+                <TextBlock x:Name="AudioInputState" Text="ON" FontWeight="Bold" FontSize="9"
+                           VerticalAlignment="Center" Margin="5,0,0,0"/>
+            </WrapPanel>
+
+            <Border Grid.Row="7" Height="1" Background="{StaticResource StrokeBrush}" Margin="3,1,3,5"/>
+
+            <Grid Grid.Row="8">
+                <ListBox x:Name="ClipList" MouseDoubleClick="ClipList_OnMouseDoubleClick" SelectionChanged="ClipList_OnSelectionChanged"
+                         ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                    <ListBox.Resources>
+                        <Style TargetType="ListBoxItem" BasedOn="{StaticResource {x:Type ListBoxItem}}">
+                            <Setter Property="Padding" Value="7,4"/>
+                            <Setter Property="FontSize" Value="11"/>
+                        </Style>
+                    </ListBox.Resources>
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="30"/><ColumnDefinition/></Grid.ColumnDefinitions>
+                                <TextBlock Text="{Binding Index}" Foreground="{StaticResource MutedBrush}" FontSize="10"/>
+                                <TextBlock Grid.Column="1" Text="{Binding Name}" ToolTip="{Binding FullPath}"
+                                           TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/>
+                            </Grid>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+
+                <ScrollViewer x:Name="TitleScroll" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
+                    <StackPanel>
+                        <WrapPanel Margin="0,0,0,6">
+                            <Button Content="PRESET ◀" Click="PreviousPreset_OnClick"/>
+                            <Button Content="PRESET ▶" Click="NextPreset_OnClick"/>
+                            <Button Content="APLICAR TODO" Click="ApplyAllTitles_OnClick" Style="{StaticResource AccentButton}"/>
+                        </WrapPanel>
+                        <UniformGrid Columns="4" Margin="0,0,0,7">
+                            <ToggleButton x:Name="Overlay1Toggle" Content="OVL 1" Tag="1" Click="OverlayToggle_OnClick"/>
+                            <ToggleButton x:Name="Overlay2Toggle" Content="OVL 2" Tag="2" Click="OverlayToggle_OnClick"/>
+                            <ToggleButton x:Name="Overlay3Toggle" Content="OVL 3" Tag="3" Click="OverlayToggle_OnClick"/>
+                            <ToggleButton x:Name="Overlay4Toggle" Content="OVL 4" Tag="4" Click="OverlayToggle_OnClick"/>
+                        </UniformGrid>
+                        <StackPanel x:Name="TitleFieldsPanel"/>
+                        <Border Background="#FF0C121A" BorderBrush="{StaticResource StrokeBrush}" BorderThickness="1" CornerRadius="8" Padding="8" Margin="0,8,0,0">
+                            <StackPanel>
+                                <TextBlock Text="FUENTE DE DATOS" Foreground="{StaticResource MutedBrush}" FontSize="9" FontWeight="Bold"/>
+                                <TextBox x:Name="DataSourceName" ToolTip="Nombre de la fuente de datos"/>
+                                <TextBox x:Name="DataTableName" ToolTip="Nombre de tabla/hoja"/>
+                                <WrapPanel>
+                                    <Button Content="◀ FILA" Click="DataPrevious_OnClick"/>
+                                    <Button Content="FILA ▶" Click="DataNext_OnClick"/>
+                                    <TextBox x:Name="DataRowNumber" Width="52" Text="0" ToolTip="Índice de fila, empezando en 0"/>
+                                    <Button Content="IR" Click="DataSelect_OnClick"/>
+                                </WrapPanel>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </ScrollViewer>
+
+                <StackPanel x:Name="GenericPanel" Visibility="Collapsed" VerticalAlignment="Center">
+                    <TextBlock Text="INPUT CONTROLABLE" FontSize="15" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                    <TextBlock Text="Este input dispone de transporte y posición, pero no contiene una lista." Foreground="{StaticResource MutedBrush}" TextWrapping="Wrap" TextAlignment="Center" Margin="18,8"/>
+                </StackPanel>
+            </Grid>
+
+            <Border x:Name="AtemPanel" Grid.Row="9"
+                    Background="#FF0C121A" BorderBrush="{StaticResource StrokeBrush}" BorderThickness="1"
+                    CornerRadius="8" Margin="3,4,3,0" Padding="5">
+                <Grid>
+                    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <TextBlock Text="ATEM · PGM" Foreground="{StaticResource MutedBrush}" FontSize="8.5" FontWeight="Bold" Margin="2,0,6,2"/>
+                    <TextBlock x:Name="AtemPanelHint" Grid.Column="1" Text="ATEM SIN CONEXIÓN" Foreground="{StaticResource MutedBrush}" FontSize="8.5" Margin="6,0,2,2"/>
+                    <Grid Grid.Row="1" Grid.ColumnSpan="2">
+                        <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                        <ComboBox x:Name="AtemInputSelector" MinWidth="140" SelectionChanged="AtemInputSelector_OnSelectionChanged" Style="{StaticResource AtemCompactCombo}"/>
+                        <ComboBox x:Name="AtemMeSelector" Grid.Column="1" Width="70" SelectionChanged="AtemMeSelector_OnSelectionChanged" Style="{StaticResource AtemCompactCombo}"/>
+                        <ToggleButton x:Name="AtemAutoToggle" Grid.Column="2" Content="AUTO" ToolTip="Play al entrar en PGM y Pause al salir"
+                                      Click="AtemAutoToggle_OnClick" Style="{StaticResource PlayerCompactToggle}"/>
+                    </Grid>
+                </Grid>
+            </Border>
+        </Grid>
+    </Border>
+</UserControl>
