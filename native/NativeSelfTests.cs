@@ -1,6 +1,7 @@
 using System.Text;
 using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.IO;
 using System.Collections.Concurrent;
 using System.Windows;
@@ -17,6 +18,7 @@ internal static class NativeSelfTests
         {
             TestVmixParser();
             TestAtemParser();
+            await TestAtemTransportAsync();
             TestClipDisplayName();
             TestSettings();
             TestQueryEncoding();
@@ -24,7 +26,7 @@ internal static class NativeSelfTests
             await TestAutomationAsync();
             await TestCommandBatchesAsync();
             await TestEndpointChangeAsync();
-            return "PASS · XML/ATEM y secuencias · perfiles/backup · parámetros vacíos · demo · AUTO fallo/reintento/reconexión/cancelación · lotes sin intercalado · ResumeRender tras fallo · órdenes canceladas al cambiar conexión";
+            return "PASS · XML/ATEM, UDP y secuencias · perfiles/backup · parámetros vacíos · demo · AUTO fallo/reintento/reconexión/cancelación · lotes sin intercalado · ResumeRender tras fallo · órdenes canceladas al cambiar conexión";
         }
         catch (Exception ex) { return $"FAIL · {ex}"; }
     }
@@ -90,6 +92,56 @@ internal static class NativeSelfTests
         catch (InvalidDataException) { }
         var handshake = AtemConnectionService.BuildHandshake(0x1234);
         Assert(handshake.Length == 20 && handshake[2] == 0x12 && handshake[3] == 0x34, "ATEM handshake");
+    }
+
+    private static async Task TestAtemTransportAsync()
+    {
+        using var server = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        using var rogue = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var atem = new AtemConnectionService(((IPEndPoint)server.Client.LocalEndPoint!).Port);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var seen = new ConcurrentQueue<int>();
+        var connected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var updated = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var disconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        atem.SnapshotChanged += snapshot =>
+        {
+            if (snapshot.IsConnected && snapshot.ProgramByMe.TryGetValue(0, out var source))
+            {
+                seen.Enqueue(source);
+                connected.TrySetResult();
+                if (source == 8) updated.TrySetResult();
+            }
+            if (snapshot.Status == "REINTENTANDO") disconnected.TrySetResult();
+        };
+        await atem.StartAsync("127.0.0.1");
+        var hello = await server.ReceiveAsync(timeout.Token);
+        var peer = hello.RemoteEndPoint;
+        byte[] Packet(int flags, int session, int id, byte[] body)
+        {
+            var packet = new byte[12 + body.Length];
+            Write16(packet, 0, (flags << 11) | packet.Length);
+            Write16(packet, 2, session);
+            Write16(packet, 10, id);
+            body.CopyTo(packet, 12);
+            return packet;
+        }
+        byte[] Program(int id) => Command("PrgI", new byte[] { 0, 0, 0, (byte)id });
+        async Task Send(UdpClient sender, byte[] packet) => await sender.SendAsync(packet, peer, timeout.Token);
+        await Send(server, Packet(2, 0x1234, 0, []));
+        await server.ReceiveAsync(timeout.Token); // Handshake ACK before the initial state.
+        await Send(server, Packet(1, 0x8123, 1, Program(7).Concat(Command("InCm", [])).ToArray()));
+        await connected.Task.WaitAsync(timeout.Token);
+        await Send(rogue, Packet(1, 0x8123, 2, Program(77)));
+        await Send(server, Packet(1, 0x8123, 1, Program(9))); // Duplicate must not restore old PGM.
+        await Send(server, Packet(1, 0x9999, 2, Program(66))); // Another session must not alter PGM.
+        await Send(server, Packet(1, 0x8123, 2, Program(8)));
+        await updated.Task.WaitAsync(timeout.Token);
+        Assert(seen.All(source => source is 7 or 8), "ATEM ignora emisor, sesión y secuencia ajenos");
+        await Send(server, Packet(1, 0x8123, 4, Program(10))); // Packet 3 was lost.
+        await disconnected.Task.WaitAsync(timeout.Token);
+        Assert(!atem.Snapshot.IsConnected && !seen.Contains(10), "ATEM resynchroniza sin publicar PGM incompleto");
+        await atem.StopAsync();
     }
 
     private static void TestClipDisplayName()

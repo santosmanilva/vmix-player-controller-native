@@ -222,6 +222,7 @@ public sealed class VmixConnectionService : IAsyncDisposable
                     long revision;
                     lock (stateLock) revision = feedbackRevision;
                     var snapshot = await FetchSnapshotAsync(token);
+                    token.ThrowIfCancellationRequested();
                     lock (stateLock)
                     {
                         // A response started before a command must not undo its newer feedback.

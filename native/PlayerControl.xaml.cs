@@ -25,6 +25,7 @@ public partial class PlayerControl : UserControl
     private bool seeking;
     private bool rendering;
     private readonly AtemPlaybackAutomation automation = new();
+    private long automationEvaluation;
     private bool goRunning;
     private bool titlesRunning;
     private int lastPlayingIndex = -1;
@@ -138,11 +139,14 @@ public partial class PlayerControl : UserControl
         InputSelector.SelectedItem = selected;
         suppressSelection = false;
         var assignmentChanged = choice?.Service != selected?.Service || choice?.Input.Key != selected?.Input.Key;
+        var listChanged = assignmentChanged || (selected != null && choice != null && !selected.Input.ListItems.SequenceEqual(choice.Input.ListItems));
+        var fieldsChanged = assignmentChanged || (selected != null && choice != null &&
+            !selected.Input.TextFields.Select(f => f.Name).SequenceEqual(choice.Input.TextFields.Select(f => f.Name)));
         choice = selected;
         if (selected != null)
         {
             RenderMode(selected.Input);
-            RenderState(selected.Input, true, assignmentChanged);
+            RenderState(selected.Input, listChanged, fieldsChanged);
         }
         else if (choices.Count > 0 && string.IsNullOrEmpty(config.InputKey)) InputSelector.SelectedIndex = 0;
         else
@@ -510,14 +514,23 @@ public partial class PlayerControl : UserControl
 
     private async Task EvaluateAtemAutomationAsync(AtemSnapshot snapshot)
     {
+        var evaluation = ++automationEvaluation;
         var target = choice;
-        if (config == null || !config.AtemAutoPlayPause || target?.Input.IsList != true || config.AtemInputId <= 0)
+        if (config == null || !config.AtemAutoPlayPause || config.AtemInputId <= 0 || target?.Input.IsList == false)
         {
             automation.Reset();
             AtemAutoToggle.Content = "AUTO";
             return;
         }
-        bool? onAir = snapshot.IsConnected && target.Service.IsConnected
+        if (target == null)
+        {
+            // A reconnect temporarily clears the input catalog; retain a pending Pause.
+            await automation.ReconcileAsync($"{config.VmixName}:{config.InputKey}", null, (_, _) => Task.CompletedTask);
+            AtemAutoToggle.Content = "AUTO ?";
+            return;
+        }
+        var programKnown = config.AtemMe < 0 ? snapshot.ProgramByMe.Count > 0 : snapshot.ProgramByMe.ContainsKey(config.AtemMe);
+        bool? onAir = snapshot.IsConnected && target.Service.IsConnected && programKnown
             ? snapshot.IsOnProgram(config.AtemInputId, config.AtemMe) : null;
         var identity = $"{target.Service.Name}:{target.Service.ConnectionGeneration}:{target.Input.Key}:{config.AtemInputId}:{config.AtemMe}";
         await automation.ReconcileAsync(identity, onAir, async (play, token) =>
@@ -525,6 +538,7 @@ public partial class PlayerControl : UserControl
             await target.Service.CommandAsync(play ? "Play" : "Pause", target.Input.Key, token: token);
             LogService.Write("ATEM", $"Player {PlayerNumber}: {(play ? "Play" : "Pause")} confirmado por HTTP");
         });
+        if (evaluation != automationEvaluation) return;
         AtemAutoToggle.Content = onAir == null ? "AUTO ?" : automation.IsPending ? "AUTO …" : onAir == true ? "PGM ●" : "AUTO";
         AtemAutoToggle.ToolTip = string.IsNullOrEmpty(automation.LastError)
             ? "Play al entrar en PGM y Pause al salir; se recupera al reconectar"

@@ -1,5 +1,6 @@
 using System.Net;
 using System.IO;
+using System.Diagnostics;
 using System.Net.Sockets;
 using System.Text;
 
@@ -11,7 +12,10 @@ namespace VMixPlayerController;
 /// </summary>
 public sealed class AtemConnectionService : IAsyncDisposable
 {
-    private const int AtemPort = 9910;
+    private readonly int atemPort;
+
+    public AtemConnectionService() : this(9910) { }
+    internal AtemConnectionService(int port) => atemPort = port;
     private readonly SemaphoreSlim lifecycleGate = new(1, 1);
     private CancellationTokenSource? cancellation;
     private Task? worker;
@@ -85,7 +89,7 @@ public sealed class AtemConnectionService : IAsyncDisposable
         sessionId = (ushort)Random.Shared.Next(1, 32767);
         using var udp = new UdpClient(new IPEndPoint(IPAddress.Any, 0));
         udp.Client.ReceiveBufferSize = 1024 * 128;
-        var endpoint = new IPEndPoint(IPAddress.Parse(Host), AtemPort);
+        var endpoint = new IPEndPoint(IPAddress.Parse(Host), atemPort);
         var handshake = BuildHandshake(sessionId);
         await udp.SendAsync(handshake, handshake.Length, endpoint);
         Publish(false, "CONECTANDO");
@@ -94,10 +98,13 @@ public sealed class AtemConnectionService : IAsyncDisposable
         var established = false;
         var dataSessionEstablished = false;
         ushort lastPacketId = 0;
+        var lastValidPacket = Stopwatch.GetTimestamp();
         while (!token.IsCancellationRequested)
         {
             using var receiveTimeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-            receiveTimeout.CancelAfter(TimeSpan.FromSeconds(initialized ? 5 : 3));
+            var remaining = TimeSpan.FromSeconds(initialized ? 5 : 3) - Stopwatch.GetElapsedTime(lastValidPacket);
+            if (remaining <= TimeSpan.Zero) throw new TimeoutException("La ATEM no responde con un estado válido");
+            receiveTimeout.CancelAfter(remaining);
             UdpReceiveResult result;
             try { result = await udp.ReceiveAsync(receiveTimeout.Token); }
             catch (OperationCanceledException) when (!token.IsCancellationRequested) { throw new TimeoutException("La ATEM no responde"); }
@@ -112,10 +119,19 @@ public sealed class AtemConnectionService : IAsyncDisposable
 
             if ((flags & 0x02) != 0)
             {
-                if (established) throw new IOException("La ATEM ha reiniciado la sesión");
+                if (established)
+                {
+                    if (!dataSessionEstablished && packetSession == sessionId)
+                    {
+                        await SendAckAsync(udp, endpoint, lastPacketId);
+                        continue;
+                    }
+                    throw new IOException("La ATEM ha reiniciado la sesión");
+                }
                 sessionId = packetSession;
                 lastPacketId = ReadUInt16(packet, 10);
                 established = true;
+                lastValidPacket = Stopwatch.GetTimestamp();
                 await SendAckAsync(udp, endpoint, lastPacketId);
                 continue;
             }
@@ -136,6 +152,7 @@ public sealed class AtemConnectionService : IAsyncDisposable
                     continue;
                 }
                 lastPacketId = packetId;
+                lastValidPacket = Stopwatch.GetTimestamp();
                 changed = ParseCommandBlock(packet, 12, packetLength - 12, inputs, programByMe, ref initialized);
                 await SendAckAsync(udp, endpoint, lastPacketId);
             }
