@@ -24,7 +24,13 @@ public partial class PlayerControl : UserControl
     private bool suppressSelection;
     private bool seeking;
     private bool rendering;
-    private bool? lastAtemOnAir;
+    private readonly AtemPlaybackAutomation automation = new();
+    private bool goRunning;
+    private bool titlesRunning;
+    private int lastPlayingIndex = -1;
+    private readonly HashSet<string> dirtyTitleFields = new();
+    private bool updatingTitleValues;
+    private string sourceSignature = "";
 
     public int PlayerNumber { get; private set; }
 
@@ -32,6 +38,18 @@ public partial class PlayerControl : UserControl
 
     public void Configure(int number, PlayerConfig playerConfig, IEnumerable<VmixConnectionService> vmixServices, AtemConnectionService atemService, Action onSaveRequested)
     {
+        foreach (var oldService in services)
+        {
+            oldService.SnapshotChanged -= ServiceOnSnapshotChanged;
+            oldService.ConnectionChanged -= ServiceOnConnectionChanged;
+        }
+        if (atem != null) atem.SnapshotChanged -= AtemOnSnapshotChanged;
+        services.Clear();
+        automation.Reset();
+        choice = null;
+        sourceSignature = "";
+        lastPlayingIndex = -1;
+        dirtyTitleFields.Clear();
         PlayerNumber = number;
         PlayerName.Text = $"PLAYER {number}";
         config = playerConfig;
@@ -44,26 +62,33 @@ public partial class PlayerControl : UserControl
             service.ConnectionChanged += ServiceOnConnectionChanged;
         }
         atem.SnapshotChanged += AtemOnSnapshotChanged;
+        suppressSelection = true;
         AtemMeSelector.ItemsSource = AtemMeChoices;
         AtemMeSelector.SelectedItem = AtemMeChoices.FirstOrDefault(choice => choice.Value == config.AtemMe) ?? AtemMeChoices[0];
         AtemAutoToggle.IsChecked = config.AtemAutoPlayPause;
+        suppressSelection = false;
         UpdateSources();
         UpdateAtemInputs(atem.Snapshot);
     }
 
     public async Task GoAsync()
     {
-        if (choice == null) return;
+        var target = choice;
+        if (target == null || !target.Service.IsConnected || goRunning) return;
+        goRunning = true;
+        var commands = config.SelectedMixes.Order().Select(mix => new VmixCommand("ActiveInput", target.Input.Key,
+            new Dictionary<string, string> { ["Mix"] = mix.ToString() })).ToList();
+        if (config.GoAudioAuto) commands.Add(new("AudioAuto", target.Input.Key));
+        if (config.GoRestart) commands.Add(new("Restart", target.Input.Key));
+        commands.Add(new("Play", target.Input.Key));
         try
         {
-            foreach (var mix in config.SelectedMixes.Order())
-                await choice.Service.CommandAsync("ActiveInput", choice.Input.Key, new Dictionary<string, string> { ["Mix"] = mix.ToString() });
-            if (config.GoAudioAuto) await choice.Service.CommandAsync("AudioAuto", choice.Input.Key);
-            if (config.GoRestart) await choice.Service.CommandAsync("Restart", choice.Input.Key);
-            else await choice.Service.CommandAsync("Play", choice.Input.Key);
+            await target.Service.ExecuteBatchAsync(commands);
             SetTransientStatus("GO EJECUTADO", true);
         }
+        catch (OperationCanceledException) { SetTransientStatus("GO CANCELADO", false); }
         catch (Exception ex) { ShowError(ex); }
+        finally { goRunning = false; }
     }
 
     public async Task TogglePlayAsync()
@@ -72,51 +97,80 @@ public partial class PlayerControl : UserControl
         await SendAsync(choice.Input.IsPlaying ? "Pause" : "Play");
     }
 
-    private void ServiceOnSnapshotChanged(VmixConnectionService service, VmixSnapshot snapshot)
+    private void ServiceOnSnapshotChanged(VmixConnectionService service, VmixSnapshot snapshot) => Dispatcher.BeginInvoke(async () =>
     {
-        Dispatcher.BeginInvoke(() =>
+        var signature = BuildSourceSignature();
+        if (signature != sourceSignature) UpdateSources();
+        if (choice?.Service == service)
         {
-            if (choice?.Service == service)
+            // Use the most recent snapshot if multiple notifications were queued.
+            var updated = service.Snapshot.Inputs.FirstOrDefault(i => i.Key == choice.Input.Key);
+            if (updated != null)
             {
-                var updated = snapshot.Inputs.FirstOrDefault(i => i.Key == choice.Input.Key);
-                if (updated != null)
-                {
-                    var listChanged = !updated.ListItems.Select(i => i.Value).SequenceEqual(choice.Input.ListItems.Select(i => i.Value));
-                    var fieldsChanged = !updated.TextFields.Select(i => i.Name).SequenceEqual(choice.Input.TextFields.Select(i => i.Name));
-                    choice = new InputChoice(service, updated);
-                    RenderState(updated, listChanged, fieldsChanged);
-                }
+                var listChanged = !updated.ListItems.SequenceEqual(choice.Input.ListItems);
+                var fieldsChanged = !updated.TextFields.Select(i => i.Name).SequenceEqual(choice.Input.TextFields.Select(i => i.Name));
+                choice = new InputChoice(service, updated);
+                RenderState(updated, listChanged, fieldsChanged);
             }
-            if (InputSelector.Items.Count == 0) UpdateSources();
-        });
-    }
+        }
+        UpdateAvailability();
+        await EvaluateAtemAutomationAsync(atem.Snapshot);
+    });
 
-    private void ServiceOnConnectionChanged(VmixConnectionService _) => Dispatcher.BeginInvoke(UpdateSources);
+    private void ServiceOnConnectionChanged(VmixConnectionService _) => Dispatcher.BeginInvoke(async () =>
+    {
+        UpdateSources();
+        await EvaluateAtemAutomationAsync(atem.Snapshot);
+    });
+
+    private string BuildSourceSignature() => string.Join("|", services.SelectMany(s =>
+        s.Snapshot.Inputs.Select(i => $"{s.Name}:{s.IsEnabled}:{i.Key}:{i.Number}:{i.Title}:{i.Type}")));
 
     private void UpdateSources()
     {
         if (config == null) return;
-        var selectedService = choice?.Service.Name ?? config.VmixName;
-        var selectedKey = choice?.Input.Key ?? config.InputKey;
-        var choices = services.Where(s => s.IsEnabled).SelectMany(s => s.Snapshot.Inputs.Select(i => new InputChoice(s, i))).OrderBy(c => c.Service.Name).ThenBy(c => c.Input.Number).ToList();
+        var choices = services.Where(s => s.IsEnabled).SelectMany(s => s.Snapshot.Inputs.Select(i => new InputChoice(s, i)))
+            .OrderBy(c => c.Service.Name).ThenBy(c => c.Input.Number).ToList();
+        sourceSignature = BuildSourceSignature();
         suppressSelection = true;
         InputSelector.ItemsSource = choices;
-        var selected = choices.FirstOrDefault(c => c.Service.Name == selectedService && c.Input.Key == selectedKey);
+        var selected = choices.FirstOrDefault(c => c.Service.Name == config.VmixName && c.Input.Key == config.InputKey);
         InputSelector.SelectedItem = selected;
         suppressSelection = false;
+        var assignmentChanged = choice?.Service != selected?.Service || choice?.Input.Key != selected?.Input.Key;
+        choice = selected;
         if (selected != null)
         {
-            choice = selected;
             RenderMode(selected.Input);
-            RenderState(selected.Input, true, true);
+            RenderState(selected.Input, true, assignmentChanged);
         }
         else if (choices.Count > 0 && string.IsNullOrEmpty(config.InputKey)) InputSelector.SelectedIndex = 0;
-        else if (choices.Count == 0)
+        else
         {
-            choice = null;
-            InputKind.Text = "SIN CONEXIÓN";
-            InputState.Text = "Conecta vMix A o B";
+            InputKind.Text = string.IsNullOrEmpty(config.InputKey) ? "SIN ASIGNAR" : "INPUT NO DISPONIBLE";
+            NowText.Text = "Sin contenido disponible";
+            NextText.Text = "SIGUIENTE —";
+            ClipList.ItemsSource = null;
+            TitleFieldsPanel.Children.Clear();
+            RemainingText.Text = "—";
         }
+        UpdateAvailability();
+    }
+
+    private void UpdateAvailability()
+    {
+        var available = choice?.Service.IsConnected == true;
+        foreach (var panel in new UIElement[] { TransportButtonsPanel, PositionPanel, ListOptionsPanel, AudioBusPanel, TitleScroll, ClipList })
+            panel.IsEnabled = available;
+        if (!available)
+        {
+            InputState.Text = "SIN DATOS";
+            InputState.Foreground = (Brush)FindResource("DangerBrush");
+            var received = choice?.Service.Snapshot.ReceivedAt ?? DateTime.MinValue;
+            InputState.ToolTip = received == DateTime.MinValue ? "No hay un estado válido de vMix" : $"Último estado recibido: {received:HH:mm:ss}";
+            RemainingText.Text = "—";
+        }
+        else InputState.ToolTip = null;
     }
 
     private void InputSelector_OnSelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -125,7 +179,8 @@ public partial class PlayerControl : UserControl
         choice = selected;
         config.VmixName = selected.Service.Name;
         config.InputKey = selected.Input.Key;
-        lastAtemOnAir = null;
+        automation.Reset();
+        lastPlayingIndex = -1;
         RenderMode(selected.Input);
         RenderState(selected.Input, true, true);
         saveRequested();
@@ -189,11 +244,12 @@ public partial class PlayerControl : UserControl
                 NextText.Text = currentIndex + 1 < input.ListItems.Count ? $"SIGUIENTE  {DisplayClipName(input.ListItems[currentIndex + 1].Value)}" : "SIGUIENTE  — FIN DE LISTA";
                 if (listChanged || ClipList.Items.Count != input.ListItems.Count)
                     ClipList.ItemsSource = input.ListItems.Select((item, index) => new ClipRow(index + 1, DisplayClipName(item.Value), item.Value)).ToList();
-                if (ClipList.SelectedIndex != currentIndex && currentIndex < ClipList.Items.Count)
+                if ((lastPlayingIndex != currentIndex || listChanged) && currentIndex < ClipList.Items.Count)
                 {
                     ClipList.SelectedIndex = currentIndex;
                     ClipList.ScrollIntoView(ClipList.SelectedItem);
                 }
+                lastPlayingIndex = currentIndex;
             }
             else
             {
@@ -202,7 +258,12 @@ public partial class PlayerControl : UserControl
             }
 
             if (input.IsTitle && (fieldsChanged || TitleFieldsPanel.Children.Count != input.TextFields.Count)) BuildTitleFields(input);
-            if (input.IsTitle) RenderOverlayFeedback(input);
+            if (input.IsTitle)
+            {
+                RefreshTitleValues(input);
+                RenderOverlayFeedback(input);
+            }
+            RenderMixFeedback(input);
         }
         finally { rendering = false; }
     }
@@ -243,9 +304,14 @@ public partial class PlayerControl : UserControl
     private void BuildTitleFields(VmixInput input)
     {
         TitleFieldsPanel.Children.Clear();
+        dirtyTitleFields.Clear();
         foreach (var field in input.TextFields)
         {
             var box = new TextBox { Text = field.Value, Tag = field.Name, MinWidth = 180 };
+            box.TextChanged += (_, _) =>
+            {
+                if (!updatingTitleValues) dirtyTitleFields.Add(field.Name);
+            };
             var update = new Button { Content = "ACTUALIZAR", Tag = box, MinWidth = 85 };
             update.Click += async (_, _) => await UpdateTitleFieldAsync(box);
             var grid = new Grid { Margin = new Thickness(0, 2, 0, 2) };
@@ -277,22 +343,62 @@ public partial class PlayerControl : UserControl
         catch { return cleaned; }
     }
 
+    private void RefreshTitleValues(VmixInput input)
+    {
+        updatingTitleValues = true;
+        try
+        {
+            foreach (var box in FindVisualChildren<TextBox>(TitleFieldsPanel))
+            {
+                var name = box.Tag?.ToString() ?? "";
+                var value = input.TextFields.FirstOrDefault(f => f.Name == name)?.Value;
+                if (value == null) continue;
+                if (!box.IsKeyboardFocusWithin && !dirtyTitleFields.Contains(name)) box.Text = value;
+            }
+        }
+        finally { updatingTitleValues = false; }
+    }
+
+    private void RenderMixFeedback(VmixInput input)
+    {
+        foreach (var toggle in FindVisualChildren<ToggleButton>(ListOptionsPanel))
+        {
+            if (!int.TryParse(toggle.Tag?.ToString(), out var mix)) continue;
+            var onOutput = choice != null && choice.Service.Snapshot.MixActive.TryGetValue(mix, out var active) && active == input.Number;
+            toggle.Content = $"{mix + 1}{(onOutput ? " ●" : "")}";
+            toggle.ToolTip = $"Destino de GO {(config.SelectedMixes.Contains(mix) ? "seleccionado" : "no seleccionado")}. " +
+                (onOutput ? "Este input está en la salida de este Mix." : "Este input no está en la salida de este Mix.");
+        }
+    }
+
     private async Task UpdateTitleFieldAsync(TextBox box)
     {
-        await SendAsync("SetText", new() { ["SelectedName"] = box.Tag?.ToString() ?? "", ["Value"] = box.Text });
+        var target = choice;
+        var name = box.Tag?.ToString() ?? "";
+        var value = box.Text;
+        if (await SendAsync("SetText", new() { ["SelectedName"] = name, ["Value"] = value }) && choice?.Service == target?.Service && choice?.Input.Key == target?.Input.Key && box.Text == value)
+            dirtyTitleFields.Remove(name);
     }
 
     private async void ApplyAllTitles_OnClick(object sender, RoutedEventArgs e)
     {
-        if (choice == null) return;
+        var target = choice;
+        if (target == null || titlesRunning) return;
+        var fields = FindVisualChildren<TextBox>(TitleFieldsPanel)
+            .Select(box => (Box: box, Name: box.Tag?.ToString() ?? "", Value: box.Text)).ToList();
+        var commands = new List<VmixCommand> { new("PauseRender", target.Input.Key) };
+        commands.AddRange(fields.Select(field => new VmixCommand("SetText", target.Input.Key,
+            new Dictionary<string, string> { ["SelectedName"] = field.Name, ["Value"] = field.Value })));
+        titlesRunning = true;
         try
         {
-            await choice.Service.CommandAsync("PauseRender", choice.Input.Key);
-            foreach (var box in FindVisualChildren<TextBox>(TitleFieldsPanel))
-                await choice.Service.CommandAsync("SetText", choice.Input.Key, new Dictionary<string, string> { ["SelectedName"] = box.Tag?.ToString() ?? "", ["Value"] = box.Text });
-            await choice.Service.CommandAsync("ResumeRender", choice.Input.Key);
+            await target.Service.ExecuteBatchAsync(commands, cleanup: new("ResumeRender", target.Input.Key));
+            foreach (var field in fields)
+                if (choice?.Service == target.Service && choice?.Input.Key == target.Input.Key && field.Box.Text == field.Value)
+                    dirtyTitleFields.Remove(field.Name);
         }
         catch (Exception ex) { ShowError(ex); }
+        finally { titlesRunning = false; }
     }
 
     private async void PlayPause_OnClick(object sender, RoutedEventArgs e) =>
@@ -317,7 +423,7 @@ public partial class PlayerControl : UserControl
         }
         catch (Exception ex)
         {
-            RenderOverlayFeedback(choice.Input);
+            if (choice != null) RenderOverlayFeedback(choice.Input);
             ShowError(ex);
         }
     }
@@ -351,22 +457,22 @@ public partial class PlayerControl : UserControl
     }
     private void ClipList_OnSelectionChanged(object sender, SelectionChangedEventArgs e) { }
 
-    private async void Mix_OnClick(object sender, RoutedEventArgs e)
+    private void Mix_OnClick(object sender, RoutedEventArgs e)
     {
         if (sender is not ToggleButton toggle || !int.TryParse(toggle.Tag?.ToString(), out var mix) || choice == null) return;
         if (toggle.IsChecked == true)
         {
             if (!config.SelectedMixes.Contains(mix)) config.SelectedMixes.Add(mix);
-            await SendAsync("ActiveInput", new() { ["Mix"] = mix.ToString() });
         }
         else config.SelectedMixes.Remove(mix);
+        RenderMixFeedback(choice.Input);
         saveRequested();
     }
 
     private void AtemOnSnapshotChanged(AtemSnapshot snapshot) => Dispatcher.BeginInvoke(async () =>
     {
-        UpdateAtemInputs(snapshot);
-        await EvaluateAtemAutomationAsync(snapshot);
+        UpdateAtemInputs(atem.Snapshot);
+        await EvaluateAtemAutomationAsync(atem.Snapshot);
     });
 
     private void UpdateAtemInputs(AtemSnapshot snapshot)
@@ -374,6 +480,11 @@ public partial class PlayerControl : UserControl
         var selectedId = config?.AtemInputId ?? 0;
         var placeholder = new AtemInput(0, snapshot.IsConnected ? "Selecciona entrada ATEM…" : "ATEM sin conexión", "");
         var inputs = new[] { placeholder }.Concat(snapshot.Inputs).ToList();
+        if (AtemInputSelector.ItemsSource is List<AtemInput> oldInputs && oldInputs.SequenceEqual(inputs))
+        {
+            UpdateAtemPanelState();
+            return;
+        }
         suppressSelection = true;
         AtemInputSelector.ItemsSource = inputs;
         AtemInputSelector.SelectedItem = inputs.FirstOrDefault(i => i.Id == selectedId) ?? placeholder;
@@ -399,41 +510,39 @@ public partial class PlayerControl : UserControl
 
     private async Task EvaluateAtemAutomationAsync(AtemSnapshot snapshot)
     {
-        if (config == null || !config.AtemAutoPlayPause || choice?.Input.IsList != true || config.AtemInputId <= 0)
+        var target = choice;
+        if (config == null || !config.AtemAutoPlayPause || target?.Input.IsList != true || config.AtemInputId <= 0)
         {
-            lastAtemOnAir = null;
+            automation.Reset();
+            AtemAutoToggle.Content = "AUTO";
             return;
         }
-        if (!snapshot.IsConnected) return;
-        var onAir = snapshot.IsOnProgram(config.AtemInputId, config.AtemMe);
-        AtemAutoToggle.Content = onAir ? "PGM ●" : "AUTO";
-        if (lastAtemOnAir == onAir) return;
-        var previous = lastAtemOnAir;
-        lastAtemOnAir = onAir;
-        if (onAir)
+        bool? onAir = snapshot.IsConnected && target.Service.IsConnected
+            ? snapshot.IsOnProgram(config.AtemInputId, config.AtemMe) : null;
+        var identity = $"{target.Service.Name}:{target.Service.ConnectionGeneration}:{target.Input.Key}:{config.AtemInputId}:{config.AtemMe}";
+        await automation.ReconcileAsync(identity, onAir, async (play, token) =>
         {
-            await SendAsync("Play");
-            LogService.Write("ATEM", $"Player {PlayerNumber}: Play por entrada {config.AtemInputId} en PGM");
-        }
-        else if (previous == true)
-        {
-            await SendAsync("Pause");
-            LogService.Write("ATEM", $"Player {PlayerNumber}: Pause al retirar entrada {config.AtemInputId} de PGM");
-        }
+            await target.Service.CommandAsync(play ? "Play" : "Pause", target.Input.Key, token: token);
+            LogService.Write("ATEM", $"Player {PlayerNumber}: {(play ? "Play" : "Pause")} confirmado por HTTP");
+        });
+        AtemAutoToggle.Content = onAir == null ? "AUTO ?" : automation.IsPending ? "AUTO …" : onAir == true ? "PGM ●" : "AUTO";
+        AtemAutoToggle.ToolTip = string.IsNullOrEmpty(automation.LastError)
+            ? "Play al entrar en PGM y Pause al salir; se recupera al reconectar"
+            : $"Orden pendiente: {automation.LastError}";
     }
 
     private void AtemInputSelector_OnSelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (suppressSelection || config == null) return;
         config.AtemInputId = AtemInputSelector.SelectedItem is AtemInput input ? input.Id : 0;
-        lastAtemOnAir = false;
+        automation.Reset();
         saveRequested();
     }
     private void AtemMeSelector_OnSelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (config == null || AtemMeSelector.SelectedItem is not AtemMeChoice selected) return;
+        if (suppressSelection || config == null || AtemMeSelector.SelectedItem is not AtemMeChoice selected) return;
         config.AtemMe = selected.Value;
-        lastAtemOnAir = false;
+        automation.Reset();
         saveRequested();
     }
     private async void AtemAutoToggle_OnClick(object sender, RoutedEventArgs e)
@@ -446,7 +555,7 @@ public partial class PlayerControl : UserControl
             return;
         }
         config.AtemAutoPlayPause = AtemAutoToggle.IsChecked == true;
-        lastAtemOnAir = config.AtemAutoPlayPause ? false : null;
+        automation.Reset();
         saveRequested();
         if (config.AtemAutoPlayPause) await EvaluateAtemAutomationAsync(atem.Snapshot);
     }
@@ -465,11 +574,18 @@ public partial class PlayerControl : UserControl
         catch (Exception ex) { ShowError(ex); }
     }
 
-    private async Task SendAsync(string function, Dictionary<string, string>? parameters = null)
+    private async Task<bool> SendAsync(string function, Dictionary<string, string>? parameters = null)
     {
-        if (choice == null) return;
-        try { await choice.Service.CommandAsync(function, choice.Input.Key, parameters); }
+        var target = choice;
+        if (target == null || !target.Service.IsConnected) return false;
+        try
+        {
+            await target.Service.CommandAsync(function, target.Input.Key, parameters);
+            return true;
+        }
+        catch (OperationCanceledException) { SetTransientStatus("ORDEN CANCELADA", false); }
         catch (Exception ex) { ShowError(ex); }
+        return false;
     }
 
     private void SetTransientStatus(string text, bool success)

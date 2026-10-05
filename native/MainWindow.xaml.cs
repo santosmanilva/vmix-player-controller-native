@@ -1,4 +1,6 @@
 using Microsoft.Win32;
+using System.ComponentModel;
+using System.Windows.Controls.Primitives;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -18,6 +20,9 @@ public partial class MainWindow : Window
     private readonly AtemConnectionService atem = new();
     private readonly List<PlayerControl> players = [];
     private AppSettings settings;
+    private bool connecting;
+    private bool closing;
+    private bool closedAfterCleanup;
 
     public MainWindow()
     {
@@ -73,9 +78,10 @@ public partial class MainWindow : Window
                     tools.Show();
                     await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
                     if (!tools.IsVisible) throw new InvalidOperationException("La ventana Herramientas no llegó a mostrarse.");
+                    await NativeSelfTests.RunUiAsync();
                     tools.Close();
                     Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-                    File.WriteAllText(path, "PASS · Herramientas abre con un solo vMix");
+                    File.WriteAllText(path, "PASS · Herramientas con un solo vMix · atajos · cambio de perfil · selección de clips");
                 }
                 catch (Exception ex)
                 {
@@ -107,20 +113,35 @@ public partial class MainWindow : Window
 
     private void SaveSettingsFromUi()
     {
-        settingsService.Save(settings);
+        if (!settingsService.Save(settings))
+        {
+            LastActionText.Text = "CONFIGURACIÓN NO GUARDADA";
+            LastActionText.ToolTip = settingsService.LastError;
+        }
     }
 
     private async void Connect_OnClick(object sender, RoutedEventArgs e) => await ConnectAllAsync();
 
     private async Task ConnectAllAsync()
     {
-        SaveSettingsFromUi();
-        LastActionText.Text = "Conectando dispositivos…";
-        var vmixBTask = settings.UseVmixB
-            ? vmixB.StartAsync(settings.VmixB.Host, settings.VmixB.Port)
-            : vmixB.DisableAsync();
-        await Task.WhenAll(vmixA.StartAsync(settings.VmixA.Host, settings.VmixA.Port), vmixBTask, atem.StartAsync(settings.AtemHost));
-        LastActionText.Text = "Conexiones iniciadas";
+        if (connecting || closing) return;
+        connecting = true;
+        try
+        {
+            SaveSettingsFromUi();
+            LastActionText.Text = "Conectando dispositivos…";
+            var vmixBTask = settings.UseVmixB
+                ? vmixB.StartAsync(settings.VmixB.Host, settings.VmixB.Port)
+                : vmixB.DisableAsync();
+            await Task.WhenAll(vmixA.StartAsync(settings.VmixA.Host, settings.VmixA.Port), vmixBTask, atem.StartAsync(settings.AtemHost));
+            LastActionText.Text = "Conexiones iniciadas";
+        }
+        catch (Exception ex)
+        {
+            LogService.Write("ERROR", $"Conexión: {ex.Message}");
+            LastActionText.Text = $"No se pudo conectar: {ex.Message}";
+        }
+        finally { connecting = false; }
     }
 
     private void UpdateVmixStatus(VmixConnectionService service, VmixSnapshot snapshot)
@@ -140,6 +161,12 @@ public partial class MainWindow : Window
         dot.Fill = (Brush)FindResource(service.IsConnected ? "SuccessBrush" : "DangerBrush");
         status.Text = service.IsConnected ? $"ONLINE · {snapshot.LatencyMs} ms" : service.LastError.ToUpperInvariant();
         status.ToolTip = service.IsConnected ? $"vMix {snapshot.Version} · {snapshot.Edition}" : service.LastError;
+        if (!service.IsConnected)
+        {
+            production.Text = "SIN DATOS";
+            production.Foreground = (Brush)FindResource("MutedBrush");
+            return;
+        }
         production.Text = $"REC {(snapshot.Recording ? "●" : "○")}  STR {(snapshot.Streaming ? "●" : "○")}  EXT {(snapshot.External ? "●" : "○")}";
         production.Foreground = snapshot.Recording || snapshot.Streaming ? (Brush)FindResource("SuccessBrush") : (Brush)FindResource("MutedBrush");
     }
@@ -162,6 +189,7 @@ public partial class MainWindow : Window
 
     private async void Settings_OnClick(object sender, RoutedEventArgs e)
     {
+        if (connecting || closing) return;
         var dialog = new SettingsWindow(settings) { Owner = this };
         if (dialog.ShowDialog() != true) return;
         SaveSettingsFromUi();
@@ -171,6 +199,7 @@ public partial class MainWindow : Window
 
     private void Profile_OnClick(object sender, RoutedEventArgs e)
     {
+        if (connecting || closing) return;
         var menu = new ContextMenu();
         var export = new MenuItem { Header = "Exportar perfil…" };
         export.Click += (_, _) => ExportProfile();
@@ -197,17 +226,27 @@ public partial class MainWindow : Window
         if (dialog.ShowDialog(this) != true) return;
         try
         {
-            settings = settingsService.Import(dialog.FileName);
-            settingsService.Save(settings);
-            MessageBox.Show("Perfil importado. El programa se reiniciará visualmente al volver a abrirlo.", "Perfil", MessageBoxButton.OK, MessageBoxImage.Information);
-            LoadSettingsIntoUi();
+            var imported = settingsService.Import(dialog.FileName);
+            if (!settingsService.Save(imported)) throw new IOException(settingsService.LastError);
+            connecting = true;
+            try
+            {
+                await Task.WhenAll(vmixA.StopAsync(), vmixB.StopAsync(), atem.StopAsync());
+                settings = imported;
+                for (var i = 0; i < players.Count; i++)
+                    players[i].Configure(i + 1, settings.Players[i], [vmixA, vmixB], atem, SaveSettingsFromUi);
+                LoadSettingsIntoUi();
+            }
+            finally { connecting = false; }
             await ConnectAllAsync();
+            LastActionText.Text = "Perfil importado y aplicado";
         }
         catch (Exception ex) { MessageBox.Show(ex.Message, "Perfil no válido", MessageBoxButton.OK, MessageBoxImage.Warning); }
     }
 
     private async void Window_OnPreviewKeyDown(object sender, KeyEventArgs e)
     {
+        if (e.IsRepeat || closing || IsEditingText(Keyboard.FocusedElement as DependencyObject)) return;
         var playerIndex = e.Key switch { Key.F1 => 0, Key.F2 => 1, Key.F3 => 2, Key.F4 => 3, _ => -1 };
         if (playerIndex >= 0)
         {
@@ -221,6 +260,10 @@ public partial class MainWindow : Window
             await player.TogglePlayAsync();
         }
     }
+
+    internal static bool IsEditingText(DependencyObject? element) =>
+        FindParent<TextBoxBase>(element) != null || FindParent<PasswordBox>(element) != null ||
+        FindParent<ComboBox>(element)?.IsEditable == true;
 
     private static T? FindParent<T>(DependencyObject? child) where T : DependencyObject
     {
@@ -247,12 +290,23 @@ public partial class MainWindow : Window
         encoder.Save(stream);
     }
 
-    protected override void OnClosed(EventArgs e)
+    protected override async void OnClosing(CancelEventArgs e)
     {
-        SaveSettingsFromUi();
-        vmixA.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        vmixB.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        atem.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        base.OnClosed(e);
+        base.OnClosing(e);
+        if (e.Cancel || closedAfterCleanup) return;
+        e.Cancel = true;
+        if (closing) return;
+        closing = true;
+        IsEnabled = false;
+        try
+        {
+            SaveSettingsFromUi();
+            await vmixA.DisposeAsync();
+            await vmixB.DisposeAsync();
+            await atem.DisposeAsync();
+        }
+        catch (Exception ex) { LogService.Write("ERROR", $"Cierre: {ex.Message}"); }
+        closedAfterCleanup = true;
+        Close();
     }
 }

@@ -9,12 +9,17 @@ namespace VMixPlayerController;
 
 public sealed class VmixConnectionService : IAsyncDisposable
 {
-    private readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(3) };
+    private readonly HttpClient http;
+    private readonly SemaphoreSlim lifecycleGate = new(1, 1);
+    private readonly object stateLock = new();
+    private long feedbackRevision;
+    public long ConnectionGeneration { get; private set; }
     private readonly SemaphoreSlim commandGate = new(1, 1);
     private CancellationTokenSource? cancellation;
     private Task? pollTask;
     private List<VmixInput> demoInputs = [];
     private readonly Dictionary<int, int> demoOverlays = [];
+    private readonly Dictionary<int, int> demoMixes = [];
     private readonly Dictionary<string, bool> knownAutoNext = new(StringComparer.OrdinalIgnoreCase);
     private bool demoRecording, demoStreaming, demoExternal, demoMultiCorder;
 
@@ -29,96 +34,173 @@ public sealed class VmixConnectionService : IAsyncDisposable
     public event Action<VmixConnectionService, VmixSnapshot>? SnapshotChanged;
     public event Action<VmixConnectionService>? ConnectionChanged;
 
-    public VmixConnectionService(string name) => Name = name;
+    public VmixConnectionService(string name, HttpMessageHandler? handler = null)
+    {
+        Name = name;
+        http = handler == null ? new HttpClient() : new HttpClient(handler);
+        http.Timeout = TimeSpan.FromSeconds(3);
+    }
 
     public async Task StartAsync(string host, int port)
     {
-        await StopAsync();
-        knownAutoNext.Clear();
-        demoOverlays.Clear();
-        IsEnabled = true;
-        Host = string.IsNullOrWhiteSpace(host) ? "127.0.0.1" : host.Trim();
-        Port = port is > 0 and <= 65535 ? port : 8088;
-        IsDemo = Host.Equals("demo", StringComparison.OrdinalIgnoreCase);
-        cancellation = new CancellationTokenSource();
+        await lifecycleGate.WaitAsync();
+        try
+        {
+            await StopCoreAsync();
+            knownAutoNext.Clear();
+            demoOverlays.Clear();
+            demoMixes.Clear();
+            foreach (var pair in new Dictionary<int, int> { [0] = 1, [1] = 2, [2] = 1, [3] = 4 }) demoMixes[pair.Key] = pair.Value;
+            IsEnabled = true;
+            Host = string.IsNullOrWhiteSpace(host) ? "127.0.0.1" : host.Trim();
+            Port = port is > 0 and <= 65535 ? port : 8088;
+            IsDemo = Host.Equals("demo", StringComparison.OrdinalIgnoreCase);
+            cancellation = new CancellationTokenSource();
 
-        if (IsDemo)
-        {
-            demoInputs = CreateDemoInputs(Name);
-            var demoTitle = demoInputs.FirstOrDefault(input => input.IsTitle);
-            if (demoTitle != null) demoOverlays[1] = demoTitle.Number;
-            SetSnapshot(BuildDemoSnapshot(0));
-            SetConnected(true, "");
-        }
-        else
-        {
-            SetSnapshot(VmixSnapshot.Empty);
-            try
+            if (IsDemo)
             {
-                SetSnapshot(await FetchSnapshotAsync(cancellation.Token));
+                demoInputs = CreateDemoInputs(Name);
+                var demoTitle = demoInputs.FirstOrDefault(input => input.IsTitle);
+                if (demoTitle != null) demoOverlays[1] = demoTitle.Number;
+                SetSnapshot(BuildDemoSnapshot(0));
                 SetConnected(true, "");
             }
-            catch (Exception ex)
+            else
             {
-                SetConnected(false, FriendlyError(ex));
+                SetSnapshot(VmixSnapshot.Empty);
+                try
+                {
+                    SetSnapshot(await FetchSnapshotAsync(cancellation.Token));
+                    SetConnected(true, "");
+                }
+                catch (Exception ex)
+                {
+                    SetConnected(false, FriendlyError(ex));
+                }
             }
-        }
 
-        pollTask = Task.Run(() => PollLoopAsync(cancellation.Token));
+            var token = cancellation.Token;
+            pollTask = Task.Run(() => PollLoopAsync(token));
+        }
+        finally { lifecycleGate.Release(); }
     }
 
     public async Task DisableAsync()
     {
-        IsEnabled = false;
-        await StopAsync();
-        IsDemo = false;
-        demoInputs.Clear();
-        SetSnapshot(VmixSnapshot.Empty);
-        SetConnected(false, "Desactivado");
+        await lifecycleGate.WaitAsync();
+        try
+        {
+            await StopCoreAsync();
+            IsEnabled = false;
+            IsDemo = false;
+            lock (stateLock) demoInputs.Clear();
+            SetSnapshot(VmixSnapshot.Empty);
+            SetConnected(false, "Desactivado");
+        }
+        finally { lifecycleGate.Release(); }
     }
 
     public async Task StopAsync()
     {
-        if (cancellation == null) return;
-        cancellation.Cancel();
-        try { if (pollTask != null) await pollTask.ConfigureAwait(false); } catch (OperationCanceledException) { }
-        cancellation.Dispose();
-        cancellation = null;
-        pollTask = null;
-        SetConnected(false, "Desconectado");
+        await lifecycleGate.WaitAsync();
+        try { await StopCoreAsync(); }
+        finally { lifecycleGate.Release(); }
     }
 
-    public async Task CommandAsync(string function, string? inputKey = null, IReadOnlyDictionary<string, string>? parameters = null)
+    private async Task StopCoreAsync()
     {
-        if (string.IsNullOrWhiteSpace(function)) return;
-        if (!IsEnabled) throw new InvalidOperationException($"{Name} está desactivado.");
-        if (IsDemo)
-        {
-            ApplyDemoCommand(function, inputKey, parameters);
-            LogService.Write("DEMO", $"{Name}: {function} {inputKey}");
-            return;
-        }
-
-        if (!IsConnected) throw new InvalidOperationException($"{Name} no está conectado.");
-        await commandGate.WaitAsync();
+        var session = cancellation;
+        if (session == null) return;
+        session.Cancel();
+        SetConnected(false, "Desconectado");
+        try { if (pollTask != null) await pollTask.ConfigureAwait(false); }
+        catch (OperationCanceledException) { }
+        // Drain the cancelled operation before replacing the endpoint or disposing HttpClient.
+        await commandGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            var values = new Dictionary<string, string> { ["Function"] = function };
-            if (!string.IsNullOrWhiteSpace(inputKey)) values["Input"] = inputKey;
-            if (parameters != null)
-                foreach (var pair in parameters.Where(p => !string.IsNullOrWhiteSpace(p.Value))) values[pair.Key] = pair.Value;
-            var query = string.Join("&", values.Select(p => $"{Uri.EscapeDataString(p.Key)}={Uri.EscapeDataString(p.Value)}"));
-            using var response = await http.GetAsync($"http://{Host}:{Port}/api/?{query}");
-            response.EnsureSuccessStatusCode();
-            ApplyImmediateCommandFeedback(function, inputKey, parameters);
-            LogService.Write("CMD", $"{Name}: {function}{(inputKey == null ? "" : $" · {inputKey}")}");
-        }
-        catch (Exception ex)
-        {
-            LogService.Write("ERROR", $"{Name}: {function}: {ex.Message}");
-            throw;
+            cancellation = null;
+            pollTask = null;
+            session.Dispose();
         }
         finally { commandGate.Release(); }
+    }
+
+    public Task CommandAsync(string function, string? inputKey = null,
+        IReadOnlyDictionary<string, string>? parameters = null, CancellationToken token = default) =>
+        ExecuteBatchAsync([new VmixCommand(function, inputKey, parameters)], token);
+
+    public async Task ExecuteBatchAsync(IReadOnlyList<VmixCommand> commands, CancellationToken token = default,
+        VmixCommand? cleanup = null)
+    {
+        var session = cancellation;
+        if (!IsEnabled || !IsConnected || session == null || session.IsCancellationRequested)
+            throw new InvalidOperationException($"{Name} no está conectado.");
+        var sessionToken = session.Token;
+        var endpoint = new UriBuilder("http", Host, Port, "/api/").Uri;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, sessionToken);
+        await commandGate.WaitAsync(linked.Token);
+        var started = false;
+        try
+        {
+            linked.Token.ThrowIfCancellationRequested();
+            if (!ReferenceEquals(session, cancellation) || !IsConnected)
+                throw new OperationCanceledException("La conexión ha cambiado.", linked.Token);
+            started = true;
+            foreach (var command in commands)
+            {
+                linked.Token.ThrowIfCancellationRequested();
+                await SendCommandCoreAsync(endpoint, command, linked.Token);
+            }
+        }
+        finally
+        {
+            try
+            {
+                // Resume title rendering even if a field fails, but never send cleanup to a new session.
+                if (started && cleanup != null && !sessionToken.IsCancellationRequested)
+                    await SendCommandCoreAsync(endpoint, cleanup, sessionToken);
+            }
+            finally { commandGate.Release(); }
+        }
+    }
+
+    internal static string BuildCommandQuery(VmixCommand command)
+    {
+        var values = new Dictionary<string, string> { ["Function"] = command.Function };
+        if (!string.IsNullOrWhiteSpace(command.InputKey)) values["Input"] = command.InputKey;
+        if (command.Parameters != null)
+            foreach (var pair in command.Parameters) values[pair.Key] = pair.Value;
+        return string.Join("&", values.Select(p => $"{Uri.EscapeDataString(p.Key)}={Uri.EscapeDataString(p.Value)}"));
+    }
+
+    private async Task SendCommandCoreAsync(Uri endpoint, VmixCommand command, CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(command.Function)) return;
+        try
+        {
+            if (IsDemo)
+            {
+                lock (stateLock) ApplyDemoCommand(command.Function, command.InputKey, command.Parameters);
+            }
+            else
+            {
+                using var response = await http.GetAsync(new Uri(endpoint, "?" + BuildCommandQuery(command)), token);
+                response.EnsureSuccessStatusCode();
+                lock (stateLock)
+                {
+                    feedbackRevision++;
+                    ApplyImmediateCommandFeedback(command.Function, command.InputKey, command.Parameters);
+                }
+            }
+            LogService.Write(IsDemo ? "DEMO" : "CMD", $"{Name}: {command.Function} · {command.InputKey}");
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            LogService.Write("ERROR", $"{Name}: {command.Function}: {ex.Message}");
+            throw;
+        }
     }
 
     private async Task PollLoopAsync(CancellationToken token)
@@ -129,12 +211,22 @@ public sealed class VmixConnectionService : IAsyncDisposable
             {
                 if (IsDemo)
                 {
-                    AdvanceDemo(350);
-                    SetSnapshot(BuildDemoSnapshot(2));
+                    lock (stateLock)
+                    {
+                        AdvanceDemo(350);
+                        SetSnapshot(BuildDemoSnapshot(2));
+                    }
                 }
                 else
                 {
-                    SetSnapshot(await FetchSnapshotAsync(token));
+                    long revision;
+                    lock (stateLock) revision = feedbackRevision;
+                    var snapshot = await FetchSnapshotAsync(token);
+                    lock (stateLock)
+                    {
+                        // A response started before a command must not undo its newer feedback.
+                        if (revision == feedbackRevision) SetSnapshot(snapshot);
+                    }
                     SetConnected(true, "");
                 }
             }
@@ -151,15 +243,17 @@ public sealed class VmixConnectionService : IAsyncDisposable
     private async Task<VmixSnapshot> FetchSnapshotAsync(CancellationToken token)
     {
         var sw = Stopwatch.StartNew();
-        var xml = await http.GetStringAsync($"http://{Host}:{Port}/api", token);
+        var xml = await http.GetStringAsync(new UriBuilder("http", Host, Port, "/api").Uri, token);
         sw.Stop();
-        return ApplyKnownRuntimeFeedback(ParseSnapshot(xml, sw.ElapsedMilliseconds));
+        var parsed = ParseSnapshot(xml, sw.ElapsedMilliseconds);
+        lock (stateLock) return ApplyKnownRuntimeFeedback(parsed);
     }
 
     public static VmixSnapshot ParseSnapshot(string xml, long latencyMs = 0)
     {
         var doc = XDocument.Parse(xml);
         var root = doc.Root ?? throw new InvalidDataException("Respuesta XML de vMix vacía.");
+        if (root.Name.LocalName != "vmix") throw new InvalidDataException("La respuesta no es XML de vMix.");
         var inputs = root.Element("inputs")?.Elements("input").Select(ParseInput).ToList() ?? [];
         var active = Int(root.Element("active")?.Value);
         var preview = Int(root.Element("preview")?.Value);
@@ -248,8 +342,10 @@ public sealed class VmixConnectionService : IAsyncDisposable
     private void SetConnected(bool connected, string error)
     {
         var changed = IsConnected != connected || LastError != error;
+        if (connected && !IsConnected) ConnectionGeneration++;
         IsConnected = connected;
         LastError = error;
+        if (!connected) lock (stateLock) knownAutoNext.Clear();
         if (changed)
         {
             LogService.Write(connected ? "INFO" : "WARN", $"{Name}: {(connected ? "conectado" : error)}");
@@ -288,7 +384,7 @@ public sealed class VmixConnectionService : IAsyncDisposable
         ];
     }
 
-    private VmixSnapshot BuildDemoSnapshot(long latency) => new(demoInputs.ToList(), 1, 2, new Dictionary<int, int> { [0] = 1, [1] = 2, [2] = 1, [3] = 4 },
+    private VmixSnapshot BuildDemoSnapshot(long latency) => new(demoInputs.ToList(), demoMixes.GetValueOrDefault(0), 2, new Dictionary<int, int>(demoMixes),
         demoRecording, demoStreaming, demoExternal, demoMultiCorder, "29.0 demo", "4K", latency, DateTime.Now, new Dictionary<int, int>(demoOverlays));
 
     private void AdvanceDemo(long milliseconds)
@@ -336,6 +432,8 @@ public sealed class VmixConnectionService : IAsyncDisposable
         if (index < 0) { SetSnapshot(BuildDemoSnapshot(1)); return; }
         var input = demoInputs[index];
         var value = parameters != null && parameters.TryGetValue("Value", out var v) ? v : "";
+        if (function == "ActiveInput" && parameters != null && parameters.TryGetValue("Mix", out var rawMix) && int.TryParse(rawMix, out var mix))
+            demoMixes[mix] = input.Number;
         switch (function)
         {
             case "Play": input = input with { State = "Running" }; break;
@@ -390,7 +488,7 @@ public sealed class VmixConnectionService : IAsyncDisposable
             }
             else if (function.EndsWith("Out", StringComparison.OrdinalIgnoreCase) || function.EndsWith("Off", StringComparison.OrdinalIgnoreCase))
                 overlays[overlayNumber] = 0;
-            SetSnapshot(Snapshot with { OverlayInputs = overlays, ReceivedAt = DateTime.Now });
+            SetSnapshot(Snapshot with { OverlayInputs = overlays });
         }
 
         if (string.IsNullOrWhiteSpace(inputKey)) return;
@@ -419,12 +517,14 @@ public sealed class VmixConnectionService : IAsyncDisposable
                 "AudioBusOff" => input.WithAudioBus(value, false),
                 "AudioOn" => input with { Muted = false },
                 "AudioOff" => input with { Muted = true },
+                "SetText" when parameters != null && parameters.TryGetValue("SelectedName", out var fieldName) =>
+                    input with { TextFields = input.TextFields.Select(f => f.Name == fieldName ? f with { Value = value } : f).ToList() },
                 _ => input
             };
             changed |= updated != input;
             return updated;
         }).ToList();
-        if (changed) SetSnapshot(Snapshot with { Inputs = inputs, ReceivedAt = DateTime.Now });
+        if (changed) SetSnapshot(Snapshot with { Inputs = inputs });
     }
 
     private static int OverlayNumber(string function)

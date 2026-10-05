@@ -1,5 +1,8 @@
 namespace VMixPlayerController;
 
+public sealed record VmixCommand(string Function, string? InputKey = null,
+    IReadOnlyDictionary<string, string>? Parameters = null);
+
 public sealed record VmixListItem(string Name, string Value);
 public sealed record VmixTextField(string Name, string Value);
 

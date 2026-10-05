@@ -18,3 +18,8 @@ native/obj/
 ui-layout-*.png
 tools-*.png
 self-test-*.txt
+
+native/publish*/
+*.settings.json
+*.settings.json.bak
+*.log

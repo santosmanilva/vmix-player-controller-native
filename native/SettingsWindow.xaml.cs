@@ -27,7 +27,7 @@ public partial class SettingsWindow : Window
         var vmixBHost = VmixBHostBox.Text.Trim();
         var atemHost = AtemHostBox.Text.Trim();
         var useVmixB = UseVmixBCheck.IsChecked == true;
-        if (string.IsNullOrWhiteSpace(vmixAHost) || useVmixB && string.IsNullOrWhiteSpace(vmixBHost))
+        if (!SettingsService.IsValidHost(vmixAHost) || useVmixB && !SettingsService.IsValidHost(vmixBHost))
         {
             MessageBox.Show(this, useVmixB ? "Introduce la IP o el nombre de ambos equipos vMix." : "Introduce la IP o el nombre de vMix A.", "Configuración", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
@@ -37,7 +37,7 @@ public partial class SettingsWindow : Window
             MessageBox.Show(this, "Los puertos de vMix deben estar entre 1 y 65535.", "Configuración", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
-        if (!IPAddress.TryParse(atemHost, out _))
+        if (!IPAddress.TryParse(atemHost, out var address) || address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
         {
             MessageBox.Show(this, "Introduce una dirección IP válida para la ATEM.", "Configuración", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
