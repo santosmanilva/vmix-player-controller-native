@@ -11,6 +11,7 @@ public partial class ToolsWindow : Window
     private readonly AtemConnectionService atem;
     private readonly AppSettings settings;
     private readonly SettingsService settingsService;
+    private string audioCatalog = "";
 
     public ToolsWindow(IReadOnlyList<VmixConnectionService> vmixServices, AtemConnectionService atemService, AppSettings appSettings, SettingsService appSettingsService)
     {
@@ -31,8 +32,19 @@ public partial class ToolsWindow : Window
         UpdateProductionStatus();
         UpdateAudioInputs();
         RefreshLog();
-        foreach (var service in services) service.SnapshotChanged += ServiceOnSnapshotChanged;
-        Closed += (_, _) => { foreach (var service in services) service.SnapshotChanged -= ServiceOnSnapshotChanged; };
+        foreach (var service in services)
+        {
+            service.SnapshotChanged += ServiceOnSnapshotChanged;
+            service.ConnectionChanged += ServiceOnConnectionChanged;
+        }
+        Closed += (_, _) =>
+        {
+            foreach (var service in services)
+            {
+                service.SnapshotChanged -= ServiceOnSnapshotChanged;
+                service.ConnectionChanged -= ServiceOnConnectionChanged;
+            }
+        };
     }
 
     private void ServiceOnSnapshotChanged(VmixConnectionService _, VmixSnapshot __) => Dispatcher.BeginInvoke(() =>
@@ -40,6 +52,8 @@ public partial class ToolsWindow : Window
         UpdateProductionStatus();
         UpdateAudioInputs();
     });
+
+    private void ServiceOnConnectionChanged(VmixConnectionService service) => ServiceOnSnapshotChanged(service, service.Snapshot);
 
     private void UpdateProductionStatus()
     {
@@ -114,6 +128,9 @@ public partial class ToolsWindow : Window
     private void UpdateAudioInputs()
     {
         if (AudioServiceSelector.SelectedItem is not VmixConnectionService service) return;
+        var catalog = service.Name + ":" + string.Join("|", service.Snapshot.Inputs.Select(i => $"{i.Key}:{i.Number}:{i.Title}"));
+        if (catalog == audioCatalog) return;
+        audioCatalog = catalog;
         var key = (AudioInputSelector.SelectedItem as VmixInput)?.Key;
         AudioInputSelector.ItemsSource = service.Snapshot.Inputs;
         AudioInputSelector.SelectedItem = service.Snapshot.Inputs.FirstOrDefault(i => i.Key == key) ?? service.Snapshot.Inputs.FirstOrDefault();
@@ -141,7 +158,8 @@ public partial class ToolsWindow : Window
     private bool TryAudioSelection(out VmixConnectionService service, out VmixInput input)
     {
         service = AudioServiceSelector.SelectedItem as VmixConnectionService ?? services.FirstOrDefault()!;
-        input = AudioInputSelector.SelectedItem as VmixInput ?? null!;
+        var key = (AudioInputSelector.SelectedItem as VmixInput)?.Key;
+        input = service?.Snapshot.Inputs.FirstOrDefault(i => i.Key == key)!;
         return service != null && input != null;
     }
 

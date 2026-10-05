@@ -8,7 +8,7 @@
     <AssemblyName>vMix-Player-Controller</AssemblyName>
     <RootNamespace>VMixPlayerController</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <Version>0.3.12</Version>
+    <Version>0.3.13</Version>
     <Product>vMix Player Controller</Product>
     <Title>vMix Player Controller</Title>
     <Authors>vMix Player Controller</Authors>

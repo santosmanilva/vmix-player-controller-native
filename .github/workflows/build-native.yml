@@ -2,6 +2,8 @@ name: Build native Windows portable
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
     paths:
@@ -14,6 +16,7 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -36,24 +39,32 @@ jobs:
       - name: Run native self-tests
         shell: pwsh
         run: |
-          $result = Join-Path $env:RUNNER_TEMP "vmix-player-self-test.txt"
-          $process = Start-Process native/publish/vMix-Player-Controller.exe -ArgumentList "--self-test=$result" -Wait -PassThru
-          if ($process.ExitCode -ne 0) { throw "Self-test exit code $($process.ExitCode)" }
-          $text = Get-Content $result -Raw
-          if (-not $text.StartsWith("PASS")) { throw $text }
-          Write-Host $text
-          $lightResult = Join-Path $env:RUNNER_TEMP "vmix-player-light-self-test.txt"
-          $lightProcess = Start-Process native/publish-light/vMix-Player-Controller.exe -ArgumentList "--self-test=$lightResult" -Wait -PassThru
-          if ($lightProcess.ExitCode -ne 0) { throw "Light self-test exit code $($lightProcess.ExitCode)" }
-          $lightText = Get-Content $lightResult -Raw
-          if (-not $lightText.StartsWith("PASS")) { throw $lightText }
-          Write-Host $lightText
-          $toolsResult = Join-Path $env:RUNNER_TEMP "vmix-player-tools-smoke.txt"
-          $toolsProcess = Start-Process native/publish-light/vMix-Player-Controller.exe -ArgumentList "--demo", "--tools-smoke=$toolsResult" -Wait -PassThru
-          if ($toolsProcess.ExitCode -ne 0) { throw "Tools smoke-test exit code $($toolsProcess.ExitCode)" }
-          $toolsText = Get-Content $toolsResult -Raw
-          if (-not $toolsText.StartsWith("PASS")) { throw $toolsText }
-          Write-Host $toolsText
+          $ErrorActionPreference = "Stop"
+          $results = Join-Path $env:RUNNER_TEMP "vmix-test-results"
+          New-Item -ItemType Directory -Force $results | Out-Null
+          function Invoke-ControllerTest($exe, $name, $extraArgs) {
+            $result = Join-Path $results "$name.txt"
+            $argument = if ($name -eq "tools") { "--tools-smoke=$result" } else { "--self-test=$result" }
+            $process = Start-Process $exe -ArgumentList (@($extraArgs) + ('"' + $argument + '"')) -PassThru
+            if (-not $process.WaitForExit(60000)) {
+              $process.Kill()
+              throw "$name timed out after 60 seconds"
+            }
+            $process.Refresh()
+            $text = if (Test-Path $result) { Get-Content $result -Raw } else { "No result file was produced" }
+            Write-Host "$name (exit $($process.ExitCode)): $text"
+            if ($process.ExitCode -ne 0 -or -not $text.StartsWith("PASS")) { throw "$name failed: $text" }
+          }
+          Invoke-ControllerTest "native/publish/vMix-Player-Controller.exe" "native" @()
+          Invoke-ControllerTest "native/publish-light/vMix-Player-Controller.exe" "light" @()
+          Invoke-ControllerTest "native/publish-light/vMix-Player-Controller.exe" "tools" @("--demo")
+      - name: Upload test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-diagnostics
+          path: ${{ runner.temp }}/vmix-test-results/
+          if-no-files-found: warn
       - name: Upload portable artifact
         uses: actions/upload-artifact@v4
         with:

@@ -1,4 +1,6 @@
 using System.Net;
+using System.IO;
+using System.Diagnostics;
 using System.Net.Sockets;
 using System.Text;
 
@@ -10,7 +12,11 @@ namespace VMixPlayerController;
 /// </summary>
 public sealed class AtemConnectionService : IAsyncDisposable
 {
-    private const int AtemPort = 9910;
+    private readonly int atemPort;
+
+    public AtemConnectionService() : this(9910) { }
+    internal AtemConnectionService(int port) => atemPort = port;
+    private readonly SemaphoreSlim lifecycleGate = new(1, 1);
     private CancellationTokenSource? cancellation;
     private Task? worker;
     private readonly Dictionary<int, AtemInput> inputs = [];
@@ -23,18 +29,31 @@ public sealed class AtemConnectionService : IAsyncDisposable
 
     public async Task StartAsync(string host)
     {
-        await StopAsync();
-        Host = host.Trim();
-        if (!IPAddress.TryParse(Host, out _))
+        await lifecycleGate.WaitAsync();
+        try
         {
-            Publish(false, "IP NO VÁLIDA");
-            return;
+            await StopCoreAsync();
+            Host = host.Trim();
+            if (!IPAddress.TryParse(Host, out var address) || address.AddressFamily != AddressFamily.InterNetwork)
+            {
+                Publish(false, "IP NO VÁLIDA");
+                return;
+            }
+            cancellation = new CancellationTokenSource();
+            var token = cancellation.Token;
+            worker = Task.Run(() => ConnectionLoopAsync(token));
         }
-        cancellation = new CancellationTokenSource();
-        worker = Task.Run(() => ConnectionLoopAsync(cancellation.Token));
+        finally { lifecycleGate.Release(); }
     }
 
     public async Task StopAsync()
+    {
+        await lifecycleGate.WaitAsync();
+        try { await StopCoreAsync(); }
+        finally { lifecycleGate.Release(); }
+    }
+
+    private async Task StopCoreAsync()
     {
         if (cancellation == null) return;
         cancellation.Cancel();
@@ -70,40 +89,72 @@ public sealed class AtemConnectionService : IAsyncDisposable
         sessionId = (ushort)Random.Shared.Next(1, 32767);
         using var udp = new UdpClient(new IPEndPoint(IPAddress.Any, 0));
         udp.Client.ReceiveBufferSize = 1024 * 128;
-        var endpoint = new IPEndPoint(IPAddress.Parse(Host), AtemPort);
+        var endpoint = new IPEndPoint(IPAddress.Parse(Host), atemPort);
         var handshake = BuildHandshake(sessionId);
         await udp.SendAsync(handshake, handshake.Length, endpoint);
         Publish(false, "CONECTANDO");
 
         var initialized = false;
+        var established = false;
+        var dataSessionEstablished = false;
+        ushort lastPacketId = 0;
+        var lastValidPacket = Stopwatch.GetTimestamp();
         while (!token.IsCancellationRequested)
         {
             using var receiveTimeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-            receiveTimeout.CancelAfter(TimeSpan.FromSeconds(initialized ? 5 : 3));
+            var remaining = TimeSpan.FromSeconds(initialized ? 5 : 3) - Stopwatch.GetElapsedTime(lastValidPacket);
+            if (remaining <= TimeSpan.Zero) throw new TimeoutException("La ATEM no responde con un estado válido");
+            receiveTimeout.CancelAfter(remaining);
             UdpReceiveResult result;
             try { result = await udp.ReceiveAsync(receiveTimeout.Token); }
             catch (OperationCanceledException) when (!token.IsCancellationRequested) { throw new TimeoutException("La ATEM no responde"); }
 
+            if (!result.RemoteEndPoint.Equals(endpoint)) continue;
             var packet = result.Buffer;
             if (packet.Length < 12) continue;
             var flags = packet[0] >> 3;
             var packetLength = ((packet[0] & 0x07) << 8) | packet[1];
-            if (packetLength > packet.Length || packetLength < 12) continue;
+            if (packetLength != packet.Length || packetLength < 12) continue;
             var packetSession = ReadUInt16(packet, 2);
-            if (packetSession != 0) sessionId = packetSession;
 
             if ((flags & 0x02) != 0)
             {
-                await SendAckAsync(udp, endpoint, 0);
+                if (established)
+                {
+                    if (!dataSessionEstablished && packetSession == sessionId)
+                    {
+                        await SendAckAsync(udp, endpoint, lastPacketId);
+                        continue;
+                    }
+                    throw new IOException("La ATEM ha reiniciado la sesión");
+                }
+                sessionId = packetSession;
+                lastPacketId = ReadUInt16(packet, 10);
+                established = true;
+                lastValidPacket = Stopwatch.GetTimestamp();
+                await SendAckAsync(udp, endpoint, lastPacketId);
                 continue;
             }
 
+            if (!established) continue;
             var changed = false;
             if ((flags & 0x01) != 0)
             {
                 var packetId = ReadUInt16(packet, 10);
-                await SendAckAsync(udp, endpoint, packetId);
+                // Some devices assign the final session identifier in their first data packet.
+                if (!dataSessionEstablished) { sessionId = packetSession; dataSessionEstablished = true; }
+                if (packetSession != sessionId) continue;
+                var order = ClassifyPacket(lastPacketId, packetId);
+                if (order > 1) throw new IOException("Falta un paquete ATEM; resincronizando el estado");
+                if (order == 0)
+                {
+                    await SendAckAsync(udp, endpoint, lastPacketId);
+                    continue;
+                }
+                lastPacketId = packetId;
+                lastValidPacket = Stopwatch.GetTimestamp();
                 changed = ParseCommandBlock(packet, 12, packetLength - 12, inputs, programByMe, ref initialized);
+                await SendAckAsync(udp, endpoint, lastPacketId);
             }
 
             if (changed || initialized && !Snapshot.IsConnected)
@@ -111,14 +162,25 @@ public sealed class AtemConnectionService : IAsyncDisposable
         }
     }
 
+    // ATEM sequence numbers wrap at 15 bits. Never replay an older PGM update.
+    internal static int ClassifyPacket(ushort previous, ushort current)
+    {
+        if (current >= 32768) throw new InvalidDataException("Número de paquete ATEM no válido");
+        var distance = (current - previous + 32768) % 32768;
+        return distance == 0 || distance >= 16384 ? 0 : distance;
+    }
+
     internal static bool ParseCommandBlock(byte[] packet, int offset, int length, IDictionary<int, AtemInput> targetInputs, IDictionary<int, int> targetProgramByMe, ref bool initialized)
     {
+        if (offset < 0 || length < 0 || offset > packet.Length - length)
+            throw new InvalidDataException("Bloque ATEM fuera de límites");
         var changed = false;
         var end = offset + length;
         while (offset + 8 <= end)
         {
             var commandLength = ReadUInt16(packet, offset);
-            if (commandLength < 8 || offset + commandLength > end) break;
+            if (commandLength < 8 || offset + commandLength > end)
+                throw new InvalidDataException("Comando ATEM incompleto");
             var name = Encoding.ASCII.GetString(packet, offset + 4, 4);
             var bodyOffset = offset + 8;
             var bodyLength = commandLength - 8;
@@ -158,6 +220,7 @@ public sealed class AtemConnectionService : IAsyncDisposable
             }
             offset += commandLength;
         }
+        if (offset != end) throw new InvalidDataException("Cabecera ATEM incompleta");
         return changed;
     }
 

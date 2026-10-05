@@ -83,7 +83,7 @@
 
             <StackPanel x:Name="ListOptionsPanel" Grid.Row="5" Visibility="Collapsed">
                 <WrapPanel HorizontalAlignment="Center">
-                    <TextBlock Text="MIX" Foreground="{StaticResource MutedBrush}" FontWeight="Bold" FontSize="10" VerticalAlignment="Center" Margin="0,0,5,0"/>
+                    <TextBlock Text="GO MIX" Foreground="{StaticResource MutedBrush}" FontWeight="Bold" FontSize="10" VerticalAlignment="Center" Margin="0,0,5,0"/>
                     <ToggleButton Content="1" Tag="0" Click="Mix_OnClick" Style="{StaticResource PlayerCompactToggle}"/>
                     <ToggleButton Content="2" Tag="1" Click="Mix_OnClick" Style="{StaticResource PlayerCompactToggle}"/>
                     <ToggleButton Content="3" Tag="2" Click="Mix_OnClick" Style="{StaticResource PlayerCompactToggle}"/>
